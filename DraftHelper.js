@@ -1,8 +1,12 @@
-/* DraftHelper 3.6.0.
- * Модули: DraftModel, ComponentValues, Engine, Journal, ReplaySession, NetworkObserver, PanelView, Controller.
- * Правила услуги проверяются только в поддерживаемых форматах.
- * Для запуска вставьте файл в консоль браузера, затем загрузите черновик через панель или DraftHelper.setDraft(draft).
- * Помощник не нажимает кнопки, не заполняет форму, не загружает файлы и не отправляет собственные запросы.
+/* DraftHelper 3.6.1-dev.1
+ * Изменения версии:
+ * — фильтрация подсказок по условиям displayOn/displayOff;
+ * — скрытие пустых информационных компонентов InfoScr и LabelSection;
+ * — просмотр исключённых подсказок с причинами;
+ * — подсветка ответа QuestionScr по значению из черновика с проверкой порядка кнопок;
+ * — переключатель подсветки в разделе подсказок.
+ * Запуск: откройте страницу услуги, вставьте содержимое файла в консоль браузера и нажмите Enter.
+ * Затем загрузите черновик в разделе «Данные» или вызовите DraftHelper.setDraft(draft).
  */
 (function (root) {
     'use strict';
@@ -708,7 +712,63 @@
         }
     }
 
-    const core = { BackRestTracker, canonical, valueDiff, RunText, ServiceDefinition, TransitionPredictor, DraftModel, ComponentValues, ReplaySession, NetworkObserver,
+    // Фильтрация меняет только подсказки, исходные данные и журнал сохраняются.
+    const HintPolicy = {
+        empty(raw) {
+            const v = decode(raw);
+            return v == null || typeof v === 'string' && !v.trim() ||
+                Array.isArray(v) && !v.length || object(v) && !Object.keys(v).length;
+        },
+        refs(c) {
+            return [c.ref, c.refs, c.attrs?.ref, c.attrs?.refs].flatMap(v =>
+                Array.isArray(v) ? v : object(v) && own(v, 'relation') ? [v] : [])
+                .filter(r => object(r) && ['displayOn', 'displayOff'].includes(r.relation));
+        },
+        visibility(c, engine, position) {
+            const refs = this.refs(c);
+            if (!refs.length) return { state: true, conditional: false };
+            // Порядок применения нескольких ref и логический оператор не заданы контрактом.
+            if (refs.length !== 1) return { state: null, conditional: true };
+            const r = refs[0], ctx = engine.context();
+            if (Object.keys(r).some(k => !['relatedRel', 'val', 'relation'].includes(k) && r[k] != null) ||
+                typeof r.relatedRel !== 'string' || !own(r, 'val') ||
+                !['string', 'number', 'boolean'].includes(typeof r.val) ||
+                typeof r.val === 'string' && r.val.includes('${')) return { state: null, conditional: true };
+            const local = c.cycleScope || ctx.active && ctx.cycleId;
+            const owners = engine.model?.owners.get(r.relatedRel);
+            let record;
+            if (local && (engine.model?.cycles.get(local)?.fields.has(r.relatedRel) || owners?.has(local))) {
+                const item = engine.dto?.cycledApplicantAnswerContext?.cycledApplicantAnswerItem;
+                // В обзоре нельзя переносить значение активного элемента на остальные элементы.
+                if (position !== undefined || !ctx.active || ctx.conflict || ctx.cycleId !== local) return { state: null, conditional: true };
+                record = item?.itemAnswers?.[r.relatedRel];
+            } else if (owners?.size && !engine.model?.globals.has(r.relatedRel)) return { state: null, conditional: true };
+            else record = engine.dto?.applicantAnswers?.[r.relatedRel];
+            if (!object(record) || !own(record, 'value')) return { state: null, conditional: true };
+            const value = decode(record.value);
+            if (typeof value !== typeof r.val) return { state: null, conditional: true };
+            const equal = Object.is(value, r.val);
+            return { state: r.relation === 'displayOn' ? equal : !equal, conditional: true };
+        },
+        reason(c, result, engine, position) {
+            const visibility = this.visibility(c, engine, position);
+            if (visibility.state === false) return 'Скрыт условием ' + this.refs(c)[0].relation;
+            // Неопределённый элемент цикла не означает пустой ответ.
+            const empty = ['missing', 'no-value'].includes(result.status) || result.status === 'found' && this.empty(result.answer.raw);
+            if (empty && ['infoscr', 'labelsection'].includes(String(c.type).toLowerCase())) return 'Информационный компонент без значения';
+            if (empty && visibility.conditional && visibility.state === null) return 'Нет ответа; видимость по ref/refs не определена';
+            return '';
+        },
+        questionIndex(c, result) {
+            const list = c.attrs?.answers;
+            if (String(c.type).toLowerCase() !== 'questionscr' || !Array.isArray(list) || result.status !== 'found') return -1;
+            const matches = list.map((a, i) => object(a) && own(a, 'value') &&
+                Object.is(a.value, result.answer.value) ? i : -1).filter(i => i >= 0);
+            return matches.length === 1 ? matches[0] : -1;
+        }
+    };
+
+    const core = { HintPolicy, BackRestTracker, canonical, valueDiff, RunText, ServiceDefinition, TransitionPredictor, DraftModel, ComponentValues, ReplaySession, NetworkObserver,
         Engine, Journal, diagnosticSnapshot, parseDraft, normalize, decode, format, copyValue, date, findDto, components };
     if (typeof module === 'object' && module.exports) { module.exports = core; return; }
     if (!root.document) return;
@@ -734,6 +794,61 @@
         if (parent) parent.append(node);
         return node;
     }
+    class QuestionHighlight {
+        constructor(controller) {
+            this.controller = controller; this.enabled = true; this.marked = new Set();
+            this.style = el('style');
+            this.style.textContent = '[data-drafthelper-answer="true"]{outline:3px solid #0d4cd3!important;outline-offset:3px!important;}';
+            doc.head.append(this.style);
+            this.observer = new root.MutationObserver(() => {
+                if (!this.frame) this.frame = root.requestAnimationFrame(() => { this.frame = null; this.refresh(); });
+            });
+            this.observer.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'class', 'style'] });
+        }
+        clear() {
+            for (const node of this.marked) node.removeAttribute('data-drafthelper-answer');
+            this.marked.clear();
+        }
+        refresh() {
+            this.clear();
+            const ctl = this.controller, engine = ctl.engine;
+            if (!this.enabled || !ctl.enabled || ctl.disposed || !engine.model) return;
+            const fields = components(engine.dto?.display), ctx = engine.context();
+            if (ctx.initializing && ctx.position === undefined) return;
+            const visible = node => node.getClientRects().length && root.getComputedStyle(node).visibility !== 'hidden' && !node.closest('[hidden],[aria-hidden="true"]');
+            const norm = value => plainText(value).replace(/\s+/g, ' ').trim();
+            for (const c of fields) {
+                const result = engine.resolve(c.id, c.cycleScope), index = HintPolicy.questionIndex(c, result);
+                if (index < 0 || HintPolicy.reason(c, result, engine)) continue;
+                const answers = c.attrs.answers;
+                // При условных вариантах позиция не гарантирована.
+                if (answers.some(a => HintPolicy.refs(a).length || a.hidden === true || a.attrs?.hidden === true)) continue;
+                const labels = answers.map(a => norm(a.label));
+                if (labels.some(s => !s) || new Set(labels).size !== labels.length) continue;
+                const scopes = [...doc.querySelectorAll('[id],[data-component-id]')].filter(n => n !== ctl.ui &&
+                    (n.id === c.id || n.getAttribute('data-component-id') === c.id));
+                let candidates = scopes;
+                if (!scopes.length && fields.filter(f => String(f.type).toLowerCase() === 'questionscr').length === 1) {
+                    // Без ID ищем единственный общий контейнер с полным упорядоченным набором подписей.
+                    candidates = [...new Set([...doc.querySelectorAll('button,[role="button"]')]
+                        .filter(n => visible(n) && norm(n.textContent) === labels[0]).flatMap(n => {
+                            const parents = []; for (let p = n.parentElement; p && p !== doc.body; p = p.parentElement) parents.push(p); return parents;
+                        }))];
+                }
+                const groups = candidates.map(scope => [...scope.querySelectorAll('button,[role="button"]')].filter(visible))
+                    .filter(buttons => buttons.length === answers.length && buttons.every((b, i) => norm(b.textContent) === labels[i]));
+                const targets = new Set(groups.map(buttons => buttons[index]));
+                if (targets.size !== 1) continue;
+                const target = [...targets][0];
+                target.setAttribute('data-drafthelper-answer', 'true'); this.marked.add(target);
+            }
+        }
+        dispose() {
+            this.observer.disconnect(); if (this.frame) root.cancelAnimationFrame(this.frame);
+            this.clear(); this.style.remove();
+        }
+    }
+
     class PanelView {
         constructor(controller) {
             this.controller = controller; this.selectedEntry = null; this.renderedEntry = null;
@@ -764,7 +879,7 @@
             const header = el('header', null, panel);
             el('span', '✦', header).className = 'mark';
             el('span', 'DraftHelper', header).className = 'brand';
-            this.badge = el('span', 'V3.6.0 · Готов', header); this.badge.className = 'badge';
+            this.badge = el('span', 'V3.6.1-dev.1 · Готов', header); this.badge.className = 'badge';
             this.importer = el('div', null, panel); this.importer.className = 'importer';
             el('h3', 'Загрузить черновик', this.importer);
             const firstLine = el('p', null, this.importer);
@@ -1168,7 +1283,10 @@
         renderContent() {
             if (this.controller.disposed || !this.content) return;
             this.content.replaceChildren();
-            this.badge.textContent = this.controller.enabled ? 'V3.6.0 · Активен' : 'V3.6.0 · Подсказки на паузе';
+            const toggle = el('label', 'Подсвечивать ответы QuestionScr ', this.content);
+            const checkbox = el('input', null, toggle); checkbox.type = 'checkbox'; checkbox.checked = this.controller.highlighter?.enabled !== false;
+            checkbox.addEventListener('change', () => { this.controller.highlighter.enabled = checkbox.checked; this.controller.highlighter.refresh(); });
+            this.badge.textContent = this.controller.enabled ? 'V3.6.1-dev.1 · Активен' : 'V3.6.1-dev.1 · Подсказки на паузе';
             this.renderDiagnostics();
             if (!this.controller.enabled) { el('p', 'Подсказки остановлены. Журнал продолжает записывать ответы.', this.content); return; }
             if (!this.controller.engine.model) { el('p', 'Загрузите черновик или вызовите DraftHelper.setDraft(draft)', this.content); return; }
@@ -1209,15 +1327,17 @@
                 ...fields.filter(c => c.cycleScope && c.cycleScope !== ctx.cycleId).map(c => ({ c }))
             ] : fields.map(c => ({ c }));
             let lastPosition;
+            const hidden = [];
             for (const { c, position } of entries) {
                 if (c.type === 'Redirect') continue;
                 if (this.controller.engine.model.cycles.has(c.id) && !c.cycleScope) continue;
-                if (c.type === 'InfoScr' && !this.controller.engine.model.globals.has(c.id) && !this.controller.engine.model.owners.has(c.id)) continue;
+                const result = this.controller.engine.resolve(c.id, c.cycleScope, position);
+                const reason = HintPolicy.reason(c, result, this.controller.engine, position);
+                if (reason) { hidden.push({ c, position, reason, result }); continue; }
                 if (position !== undefined && position !== lastPosition) {
                     el('h3', `Элемент ${position + 1} из ${ctx.cycle.items.length}`, this.content);
                     lastPosition = position;
                 }
-                const result = this.controller.engine.resolve(c.id, c.cycleScope, position);
                 const row = el('div', null, this.content); row.className = 'row';
                 el('strong', plainText(c.title || c.label || c.name || c.id), row);
                 if (result.status !== 'found') { el('div', messages[result.status], row); continue; }
@@ -1231,6 +1351,16 @@
                     } catch { el('div', 'Копирование недоступно; выделите текст вручную.', row); }
                 });
             }
+            if (hidden.length) {
+                const details = el('details', null, this.content); details.className = 'hidden-hints';
+                el('summary', `Скрытые подсказки: ${hidden.length}`, details);
+                for (const { c, position, reason, result } of hidden) {
+                    const row = el('div', null, details); row.className = 'row';
+                    el('strong', plainText(c.title || c.label || c.name || c.id) + (position === undefined ? '' : ` · элемент ${position + 1}`), row);
+                    el('p', reason, row);
+                    if (result.status === 'found') el('pre', plainText(ComponentValues.format(c, result.answer.raw)), row);
+                }
+            }
         }
         dispose() {
             root.removeEventListener('resize', this.resizeHandler);
@@ -1240,7 +1370,7 @@
 
     class Controller {
         constructor() {
-            this.version = '3.6.0'; this.serviceDefinition = null; this.backRest = null; this.predictionMode = 'live'; this.enabled = true; this.disposed = false; this.draft = null;
+            this.version = '3.6.1-dev.1'; this.serviceDefinition = null; this.backRest = null; this.predictionMode = 'live'; this.enabled = true; this.disposed = false; this.draft = null;
             this.session = new ReplaySession(); this.panelView = new PanelView(this);
             this.network = new NetworkObserver(root, (...args) => this.process(...args),
                 () => this.session.nextTicket(), code => this.report(code));
@@ -1292,18 +1422,18 @@
             }
             if (outcome.applied) this.render(); else this.renderDiagnostics();
         }
-        render() { if (!this.disposed) this.panelView.render(); }
+        render() { if (!this.disposed) { this.panelView.render(); this.highlighter?.refresh(); } }
         renderDiagnostics() { if (!this.disposed) this.panelView.renderDiagnostics(); }
         fitPanel() { if (!this.disposed) this.panelView.fitPanel(); }
         report(code) { console.warn(`[DraftHelper] ${code}`); }
         start() {
-            try { this.panelView.initUI(); this.network.start(); this.render(); }
+            try { this.panelView.initUI(); this.highlighter = new QuestionHighlight(this); this.network.start(); this.render(); }
             catch (error) { this.destroy(); throw error; }
         }
         destroy() {
             if (this.disposed) return;
             this.disposed = true;
-            this.network.stop(); this.panelView.dispose(); this.session.clear(); this.draft = null; this.serviceDefinition = null; this.backRest = null;
+            this.highlighter?.dispose(); this.network.stop(); this.panelView.dispose(); this.session.clear(); this.draft = null; this.serviceDefinition = null; this.backRest = null;
             if (root.DraftHelper === this) delete root.DraftHelper;
         }
     }
